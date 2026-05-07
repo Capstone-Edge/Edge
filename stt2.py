@@ -19,9 +19,9 @@ BTN_PIN = 7  # BOARD 물리 핀 7번 = GPIO09
 # 안 누름 = HIGH(1)
 # 누름 = LOW(0)
 
-print("Whisper 모델 로딩 중...")
+print("Whisper 모델 로딩 중.")
 model = whisper.load_model(MODEL_NAME)
-print("Whisper 모델 로딩 완료")
+print("Whisper 모델 로딩 완료!")
 
 GPIO.setmode(GPIO.BOARD)
 
