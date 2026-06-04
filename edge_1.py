@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Jetson Orin Nano - 음성비서 + 예약어 + Backend 연동
+Jetson Orin Nano - 음성비서 + 예약어 + Backend process API 연동
 
 기능:
 - 예약어: "개구리"
@@ -8,16 +8,16 @@ Jetson Orin Nano - 음성비서 + 예약어 + Backend 연동
 - 재질문 대기 상태에서는 예약어 없이도 사용자 답변을 백엔드로 전송
 - 말하면 자동 녹음
 - Whisper로 STT
-- Backend FastAPI로 명령 전송
+- Backend FastAPI /api/v1/commands/process 로 명령 전송
 - Backend 응답을 gTTS로 블루투스 스피커 출력
 - TTS 출력 중/직후에는 마이크 입력 무시
 - VAD 녹음 파일을 last_vad_record.wav로 저장해서 디버깅 가능
 
 실행 예:
-BACKEND_URL=http://100.104.72.38:8000 INPUT_DEVICE=24 WHISPER_MODEL=small python3 voice_ai_wake_frog.py
+BACKEND_URL=http://100.104.72.38:8000 INPUT_DEVICE=24 WHISPER_MODEL=small python3 edge_1.py
 
 빠른 테스트:
-BACKEND_URL=http://100.104.72.38:8000 INPUT_DEVICE=24 WHISPER_MODEL=base python3 voice_ai_wake_frog.py
+BACKEND_URL=http://100.104.72.38:8000 INPUT_DEVICE=24 WHISPER_MODEL=base python3 edge_1.py
 
 종료:
 Ctrl + C
@@ -30,8 +30,6 @@ import queue
 import tempfile
 import collections
 import subprocess
-import random
-import uuid
 from typing import Any
 
 import numpy as np
@@ -47,17 +45,16 @@ from gtts import gTTS
 # 기본 설정
 # ============================================================
 
-# tiny / base / small 중 선택 가능
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 
-# sounddevice 입력 장치 번호.
+# sounddevice 입력 장치 번호
 # 확인 명령:
 # python3 -c "import sounddevice as sd; print(sd.query_devices())"
 INPUT_DEVICE_ENV = os.getenv("INPUT_DEVICE", "").strip()
 INPUT_DEVICE = int(INPUT_DEVICE_ENV) if INPUT_DEVICE_ENV else 24
 
 # USB PnP Audio Device가 16kHz를 직접 지원하지 않으므로 48kHz 사용
-# WebRTC VAD는 8000/16000/32000/48000 지원
+# WebRTC VAD는 8000 / 16000 / 32000 / 48000 지원
 SAMPLE_RATE = 48000
 CHANNELS = 1
 FRAME_MS = 30
@@ -96,6 +93,9 @@ WAKE_WORDS = [
     "개굴아",
     "개구라",
     "깨굴이",
+    "개고리",
+    "메구리",
+    "데구리"
 ]
 
 
@@ -104,14 +104,11 @@ WAKE_WORDS = [
 # ============================================================
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://100.104.72.38:8000").rstrip("/")
-EDGE_DEVICE_ID = os.getenv("EDGE_DEVICE_ID", "edge-desktop")
+
+CLIENT_ID = os.getenv("EDGE_CLIENT_ID", "edge-pi-01")
+DEVICE_ID = os.getenv("EDGE_DEVICE_ID", "edge-pi-01")
+
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "10"))
-
-# parse/clarify 결과 commands가 있으면 execute까지 자동 호출
-AUTO_EXECUTE_COMMANDS = os.getenv("AUTO_EXECUTE_COMMANDS", "1") == "1"
-
-# 백엔드 연결 실패 시 simple_ai_reply로 임시 응답할지 여부
-USE_FALLBACK_REPLY = os.getenv("USE_FALLBACK_REPLY", "0") == "1"
 
 
 # ============================================================
@@ -123,10 +120,9 @@ audio_q = queue.Queue(maxsize=100)
 is_tts_playing = False
 ignore_audio_until = 0.0
 
-# 백엔드 대화 상태
+# Backend 대화 세션 상태
 current_session_id: str | None = None
 waiting_for_clarification = False
-current_clarification_turn = 0
 
 
 # ============================================================
@@ -151,7 +147,8 @@ def audio_callback(indata, frames, time_info, status):
     - TTS 직후 잔향 구간도 입력을 버림
     - 큐가 가득 차면 새 입력을 버려 overflow 누적을 줄임
     """
-    global is_tts_playing, ignore_audio_until
+    global is_tts_playing
+    global ignore_audio_until
 
     if status:
         print(f"[AUDIO] {status}", file=sys.stderr)
@@ -190,13 +187,14 @@ def remove_wake_words_from_text(text: str) -> str:
     """원문에서 예약어 후보를 제거"""
     command = text.strip()
 
-    for w in sorted(WAKE_WORDS, key=len, reverse=True):
-        command = command.replace(w, "")
-        command = command.replace(w.upper(), "")
-        command = command.replace(w.capitalize(), "")
+    for wake_word in sorted(WAKE_WORDS, key=len, reverse=True):
+        command = command.replace(wake_word, "")
+        command = command.replace(wake_word.upper(), "")
+        command = command.replace(wake_word.capitalize(), "")
 
     command = command.strip()
     command = command.strip(" ,.!?~:;")
+
     return command
 
 
@@ -212,82 +210,14 @@ def extract_command_with_wake_word(text: str):
     original = text.strip()
     normalized = normalize_text(original)
 
-    for wake in WAKE_WORDS:
-        nwake = normalize_text(wake)
-        if nwake in normalized:
+    for wake_word in WAKE_WORDS:
+        normalized_wake_word = normalize_text(wake_word)
+
+        if normalized_wake_word in normalized:
             command = remove_wake_words_from_text(original)
-            return True, command, wake
+            return True, command, wake_word
 
     return False, "", ""
-
-
-# ============================================================
-# 임시 fallback 응답 함수
-# ============================================================
-
-def simple_ai_reply(user_text: str) -> str:
-    """
-    백엔드 연결 실패 시 쓸 수 있는 fallback 응답.
-    기본 실행에서는 USE_FALLBACK_REPLY=0 이므로 거의 사용하지 않음.
-    """
-    text = user_text.strip()
-    compact = text.replace(" ", "")
-
-    if not text:
-        return "네, 말씀해 주세요."
-
-    if any(word in compact for word in ["안녕", "하이", "반가워"]):
-        return "안녕하세요. 음성비서 테스트를 시작합니다."
-
-    if any(word in compact for word in ["잘돼", "작동", "테스트"]):
-        return "네, 현재 음성 인식과 음성 출력 테스트가 동작 중입니다."
-
-    if "불" in compact or "조명" in compact:
-        if "켜" in compact:
-            return "조명을 켰습니다."
-        if "꺼" in compact:
-            return "조명을 껐습니다."
-        return "조명을 어떻게 할까요?"
-
-    if "에어컨" in compact or "냉방" in compact:
-        if "켜" in compact:
-            return "에어컨을 켰습니다. 원하는 온도를 말씀해 주세요."
-        if "꺼" in compact:
-            return "에어컨을 껐습니다."
-        if "도" in compact:
-            return "알겠습니다. 말씀하신 온도로 에어컨을 설정하겠습니다."
-        return "에어컨을 어떻게 제어할까요?"
-
-    if "청소" in compact or "청소기" in compact:
-        if "시작" in compact or "켜" in compact:
-            return "청소를 시작하겠습니다."
-        if "멈춰" in compact or "중지" in compact or "꺼" in compact:
-            return "청소를 중지하겠습니다."
-        return "청소기를 어떻게 할까요?"
-
-    if (
-        "티비" in compact
-        or "tv" in compact.lower()
-        or "영화" in compact
-        or "보고싶" in compact
-    ):
-        if "매드맥스" in compact or "매드 맥스" in text:
-            return "매드맥스를 재생하겠습니다."
-        return "원하시는 콘텐츠를 재생하겠습니다."
-
-    if "몇시" in compact or "시간" in compact:
-        return "현재 시간 확인 기능은 아직 연결되지 않았습니다."
-
-    if "날씨" in compact:
-        return "날씨 조회 기능은 아직 연결되지 않았습니다."
-
-    candidates = [
-        f"제가 들은 명령은, {text}, 입니다.",
-        f"{text}라고 말씀하셨습니다.",
-        "좋습니다. 해당 명령을 정상적으로 인식했습니다.",
-        "현재는 백엔드 연결 실패 시 임시 응답 모드로 동작 중입니다.",
-    ]
-    return random.choice(candidates)
 
 
 # ============================================================
@@ -295,9 +225,7 @@ def simple_ai_reply(user_text: str) -> str:
 # ============================================================
 
 def post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    백엔드 FastAPI 서버에 JSON POST 요청.
-    """
+    """백엔드 FastAPI 서버에 JSON POST 요청"""
     url = f"{BACKEND_URL}{path}"
 
     print(f"[HTTP] POST {url}")
@@ -312,89 +240,17 @@ def post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     print(f"[HTTP] status={response.status_code}")
 
     if response.status_code >= 400:
-        print(f"[HTTP ERROR] {response.text}")
+        print(f"[HTTP ERROR] {response.text}", file=sys.stderr)
         response.raise_for_status()
 
     data = response.json()
     print(f"[HTTP] response={data}")
+
     return data
 
 
-def send_parse_to_backend(command_text: str) -> dict[str, Any]:
-    """
-    최초 사용자 명령을 /api/v1/commands/parse 로 전송.
-    """
-    global current_session_id
-
-    if current_session_id is None:
-        current_session_id = f"edge-{uuid.uuid4().hex[:12]}"
-
-    payload = {
-        "session_id": current_session_id,
-        "device_id": EDGE_DEVICE_ID,
-        "stt_text": command_text,
-        "source": "edge",
-    }
-
-    return post_json("/api/v1/commands/parse", payload)
-
-
-def send_clarify_to_backend(answer_text: str) -> dict[str, Any]:
-    """
-    백엔드 재질문에 대한 사용자 답변을 /api/v1/dialogues/clarify 로 전송.
-    """
-    global current_session_id, current_clarification_turn
-
-    if current_session_id is None:
-        raise RuntimeError("clarify 요청을 보낼 session_id가 없습니다.")
-
-    payload = {
-        "device_id": EDGE_DEVICE_ID,
-        "session_id": current_session_id,
-        "user_answer": answer_text,
-        "clarification_turn": current_clarification_turn,
-    }
-
-    return post_json("/api/v1/dialogues/clarify", payload)
-
-
-def execute_backend_commands(
-    parse_or_clarify_result: dict[str, Any],
-    raw_user_input: str,
-) -> dict[str, Any]:
-    """
-    parse/clarify 결과에 commands가 있으면 /api/v1/commands/execute 호출.
-    """
-    commands = parse_or_clarify_result.get("commands") or []
-
-    if not commands:
-        return parse_or_clarify_result
-
-    session_id = parse_or_clarify_result.get("session_id") or current_session_id
-    if not session_id:
-        session_id = f"edge-{uuid.uuid4().hex[:12]}"
-
-    intent = parse_or_clarify_result.get("intent") or "device_control"
-    response_text = (
-        parse_or_clarify_result.get("response_text")
-        or "명령을 실행했습니다."
-    )
-
-    payload = {
-        "session_id": session_id,
-        "raw_user_input": raw_user_input,
-        "intent": intent,
-        "commands": commands,
-        "response_text": response_text,
-    }
-
-    return post_json("/api/v1/commands/execute", payload)
-
-
 def get_tts_text_from_result(result: dict[str, Any]) -> str:
-    """
-    백엔드 응답 dict에서 TTS로 읽을 문장을 뽑는다.
-    """
+    """백엔드 응답 dict에서 TTS로 읽을 문장을 뽑는다."""
     return (
         result.get("response_text")
         or result.get("clarification_question")
@@ -403,78 +259,97 @@ def get_tts_text_from_result(result: dict[str, Any]) -> str:
     )
 
 
-def backend_ai_reply(user_text: str) -> str:
+def update_session_state_from_result(result: dict[str, Any]) -> None:
     """
-    엣지 STT 결과를 백엔드로 보내고, TTS로 읽을 response_text를 반환.
+    Backend /api/v1/commands/process 응답 status에 따라
+    Edge의 current_session_id를 저장하거나 비운다.
 
-    일반 명령:
-    - /api/v1/commands/parse
-
-    재질문 답변:
-    - /api/v1/dialogues/clarify
-
-    명령 실행:
-    - commands가 있으면 /api/v1/commands/execute 자동 호출
+    요구사항:
+    1. waiting_clarification이면 session_id 저장
+    2. executed / cancelled / expired이면 session_id 초기화
     """
     global current_session_id
     global waiting_for_clarification
-    global current_clarification_turn
 
-    try:
-        if waiting_for_clarification:
-            result = send_clarify_to_backend(user_text)
-        else:
-            result = send_parse_to_backend(user_text)
+    status = result.get("status")
 
-        current_session_id = result.get("session_id") or current_session_id
-        current_clarification_turn = result.get(
-            "clarification_turn",
-            current_clarification_turn,
-        )
+    if status == "waiting_clarification":
+        backend_session_id = result.get("session_id")
 
-        # 재질문 필요
-        if result.get("clarification_needed") is True:
+        if backend_session_id:
+            current_session_id = backend_session_id
             waiting_for_clarification = True
-            return get_tts_text_from_result(result)
-
-        # 재질문 종료 또는 일반 명령 완료
-        waiting_for_clarification = False
-        current_clarification_turn = 0
-
-        # commands가 있으면 execute 호출
-        if AUTO_EXECUTE_COMMANDS and result.get("commands"):
-            execute_result = execute_backend_commands(result, user_text)
-            return (
-                execute_result.get("response_text")
-                or result.get("response_text")
-                or "명령을 실행했습니다."
+            print(f"[SESSION] waiting_clarification → session_id 저장: {current_session_id}")
+        else:
+            current_session_id = None
+            waiting_for_clarification = False
+            print(
+                "[SESSION WARN] waiting_clarification 응답인데 session_id가 없습니다.",
+                file=sys.stderr,
             )
 
+        return
+
+    if status in ("executed", "cancelled", "expired"):
+        print(f"[SESSION] status={status} → session_id 초기화")
+        current_session_id = None
+        waiting_for_clarification = False
+        return
+
+    # 백엔드가 다른 status를 주는 경우 안전하게 세션을 비운다.
+    print(f"[SESSION WARN] 알 수 없는 status={status} → session_id 초기화")
+    current_session_id = None
+    waiting_for_clarification = False
+
+
+def send_stt_text_to_backend(stt_text: str) -> dict[str, Any]:
+    """
+    STT 결과를 Backend의 단일 process API로 전송한다.
+
+    규칙:
+    - client_id는 항상 고정해서 보낸다.
+    - device_id도 고정해서 보낸다.
+    - session_id는 저장된 값이 있으면 포함하고, 없으면 None으로 보낸다.
+    - 백엔드 응답 status에 따라 current_session_id를 갱신한다.
+    """
+    payload = {
+        "client_id": CLIENT_ID,
+        "device_id": DEVICE_ID,
+        "session_id": current_session_id,
+        "stt_text": stt_text,
+        "source": "edge",
+    }
+
+    result = post_json("/api/v1/commands/process", payload)
+    update_session_state_from_result(result)
+
+    return result
+
+
+def backend_ai_reply(user_text: str) -> str:
+    """
+    엣지 STT 결과를 백엔드 /api/v1/commands/process 로 보내고,
+    TTS로 읽을 response_text를 반환한다.
+    """
+    try:
+        result = send_stt_text_to_backend(user_text)
         return get_tts_text_from_result(result)
 
     except requests.exceptions.ConnectionError:
         print("[BACKEND ERROR] 백엔드 서버에 연결할 수 없습니다.", file=sys.stderr)
-        if USE_FALLBACK_REPLY:
-            return simple_ai_reply(user_text)
         return "백엔드 서버에 연결할 수 없습니다."
 
     except requests.exceptions.Timeout:
         print("[BACKEND ERROR] 백엔드 응답 시간이 초과되었습니다.", file=sys.stderr)
-        if USE_FALLBACK_REPLY:
-            return simple_ai_reply(user_text)
         return "백엔드 응답 시간이 초과되었습니다."
 
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else "unknown"
         print(f"[BACKEND ERROR] HTTP {status_code}", file=sys.stderr)
-        if USE_FALLBACK_REPLY:
-            return simple_ai_reply(user_text)
         return f"백엔드 요청 중 오류가 발생했습니다. 상태 코드 {status_code}."
 
     except Exception as e:
         print(f"[BACKEND ERROR] {e}", file=sys.stderr)
-        if USE_FALLBACK_REPLY:
-            return simple_ai_reply(user_text)
         return "백엔드 처리 중 오류가 발생했습니다."
 
 
@@ -525,9 +400,11 @@ def speak_tts(text: str):
     - TTS 종료 후 일정 시간 마이크 입력 무시
     - TTS 중 쌓인 오디오 큐 제거
     """
-    global is_tts_playing, ignore_audio_until
+    global is_tts_playing
+    global ignore_audio_until
 
     text = text.strip()
+
     if not text:
         return
 
@@ -550,11 +427,15 @@ def speak_tts(text: str):
         env = os.environ.copy()
         env["PULSE_SINK"] = PULSE_SINK
 
+        # TTS 재생 속도
+        TTS_SPEED = float(os.getenv("TTS_SPEED", "0.15"))
+
         subprocess.run(
-            ["mpg123", "-q", mp3_path],
+            ["mpg123", "-q", "--pitch", str(TTS_SPEED), mp3_path],
             env=env,
             check=False,
         )
+
 
     except Exception as e:
         print(f"[ERROR] TTS 실패: {e}", file=sys.stderr)
@@ -593,7 +474,7 @@ def transcribe_whisper(model, audio_float32: np.ndarray) -> str:
         else:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
-            should_delete = True
+                should_delete = True
 
         wav.write(tmp_path, SAMPLE_RATE, audio_int16)
 
@@ -636,21 +517,17 @@ def bytes_to_float32_audio(audio_bytes: bytes) -> np.ndarray:
 
 def print_audio_devices():
     print("\n[DEVICE] sounddevice 장치 목록")
+
     try:
         print(sd.query_devices())
     except Exception as e:
         print(f"[WARN] 장치 목록 확인 실패: {e}", file=sys.stderr)
 
 
-def reset_vad_state(pre_roll):
-    """VAD 상태 초기화 보조"""
-    pre_roll.clear()
-    clear_audio_queue()
-
-
 def ready_message() -> str:
     if waiting_for_clarification:
         return "[READY] 백엔드 재질문 대기 중입니다. 예약어 없이 답변하세요."
+
     return "[READY] 계속 듣는 중입니다. '개구리 + 명령'으로 말하세요."
 
 
@@ -660,10 +537,9 @@ def ready_message() -> str:
 
 def main():
     global ignore_audio_until
-    global waiting_for_clarification
 
     print("=" * 60)
-    print(" Jetson Orin Nano 음성비서 + 예약어 + Backend 연동")
+    print(" Jetson Orin Nano 음성비서 + 예약어 + Backend process API 연동")
     print(f" Whisper 모델: {WHISPER_MODEL}")
     print(f" Input Device: {INPUT_DEVICE}")
     print(f" Sample Rate: {SAMPLE_RATE}")
@@ -675,9 +551,9 @@ def main():
     print(" 사용 예: 개구리 조명 켜줘")
     print(" 백엔드 연동: ON")
     print(f" Backend URL: {BACKEND_URL}")
-    print(f" Edge Device ID: {EDGE_DEVICE_ID}")
-    print(f" Auto Execute Commands: {AUTO_EXECUTE_COMMANDS}")
-    print(f" Fallback Reply: {USE_FALLBACK_REPLY}")
+    print(f" Client ID: {CLIENT_ID}")
+    print(f" Device ID: {DEVICE_ID}")
+    print(" Process API: /api/v1/commands/process")
     print(" 종료: Ctrl + C")
     print("=" * 60)
 
@@ -691,6 +567,7 @@ def main():
 
     pre_roll = collections.deque(maxlen=PRE_ROLL_FRAMES)
     speech_frames = []
+
     triggered = False
     voiced_count = 0
     silence_count = 0
@@ -728,6 +605,7 @@ def main():
                 continue
 
             expected_bytes = FRAME_SAMPLES * 2
+
             if len(frame) != expected_bytes:
                 continue
 
@@ -748,6 +626,7 @@ def main():
                     speech_frames = list(pre_roll)
 
                     print("\n[VOICE] 말소리 감지 → 녹음 시작")
+
                     voiced_count = 0
 
             else:
@@ -800,9 +679,9 @@ def main():
                     # 1. 재질문 대기 중이면 예약어 없이도 백엔드로 전송
                     # 2. 일반 상태면 예약어가 있어야 백엔드로 전송
                     # ----------------------------------------------------
-
                     if waiting_for_clarification:
                         command = user_text.strip()
+
                         print(f'[CLARIFY_ANSWER] "{command}"')
 
                         if not command:
@@ -827,6 +706,7 @@ def main():
                             reply = backend_ai_reply(command)
 
                     print(f'[BACKEND_REPLY] "{reply}"')
+
                     speak_tts(reply)
 
                     # TTS 후 VAD 상태 재초기화
@@ -844,6 +724,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+
     except KeyboardInterrupt:
         print("\n[EXIT] 종료")
         sys.exit(0)
