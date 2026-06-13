@@ -31,14 +31,12 @@ FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
 # ============================================================
 # VAD 설정
 # ============================================================
-
-VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "0"))
-START_TRIGGER_FRAMES = int(os.getenv("START_TRIGGER_FRAMES", "2"))
-END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "80"))
-PRE_ROLL_FRAMES = int(os.getenv("PRE_ROLL_FRAMES", "50"))
-MIN_RECORD_SEC = float(os.getenv("MIN_RECORD_SEC", "1.5"))
-MAX_RECORD_SEC = float(os.getenv("MAX_RECORD_SEC", "15.0"))
-
+VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "3"))
+START_TRIGGER_FRAMES = int(os.getenv("START_TRIGGER_FRAMES", "5"))
+END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "50"))
+PRE_ROLL_FRAMES = int(os.getenv("PRE_ROLL_FRAMES", "10"))
+MIN_RECORD_SEC = float(os.getenv("MIN_RECORD_SEC", "0.8"))
+MAX_RECORD_SEC = float(os.getenv("MAX_RECORD_SEC", "10.0"))
 
 # ============================================================
 # TTS 설정
@@ -70,19 +68,32 @@ LAST_VAD_RECORD_PATH = os.getenv("LAST_VAD_RECORD_PATH", "last_vad_record.wav")
 # ============================================================
 # 예약어 설정
 # ============================================================
-
 WAKE_WORDS = [
-    "개구리",
-    "깨구리",
-    "개굴이",
-    "개구리야",
-    "깨구리야",
-    "개굴아",
-    "개구라",
-    "깨굴이",
-    "개고리",
-    "메구리",
-    "데구리",
+    "나비",
+    "나비야",
+    "나비아",
+    "나비여",
+    "나비요",
+    "나뷔",
+    "나뷔야",
+    "나비어",
+    "나비와",
+    "나미",
+    "나미야",
+    "남이",
+    "남이야",
+    "라비",
+    "라비야",
+    "다비",
+    "다비야",
+    "답이",
+    "답이야"
+    "바비",
+    "바비야",
+    "랍이",
+    "랍이야",
+    "마비",
+    "마비야"
 ]
 
 

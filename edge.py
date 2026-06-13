@@ -3,8 +3,8 @@
 Jetson Orin Nano - 음성비서 + 예약어 + Backend process API 연동
 
 기능:
-- 예약어: "개구리"
-- 일반 상태에서는 "개구리 + 명령" 형식일 때만 백엔드로 전송
+- 예약어: "나비"
+- 일반 상태에서는 "나비 + 명령" 형식일 때만 백엔드로 전송
 - 재질문 대기 상태에서는 예약어 없이도 사용자 답변을 백엔드로 전송
 - 말하면 자동 녹음
 - Whisper로 STT
@@ -139,7 +139,7 @@ class EdgeRuntime:
         if self.waiting_for_clarification:
             return "[READY] 백엔드 재질문 대기 중입니다. 예약어 없이 답변하세요."
 
-        return "[READY] 계속 듣는 중입니다. '개구리 + 명령'으로 말하세요."
+        return "[READY] 계속 듣는 중입니다. '나비 + 명령'으로 말하세요."
 
 
 # ============================================================
@@ -222,7 +222,7 @@ def extract_command_with_wake_word(text: str):
     예약어가 없으면 (False, "", "") 반환.
 
     예:
-    "개구리 조명 켜줘" -> True, "조명 켜줘", "개구리"
+    "나비 조명 켜줘" -> True, "조명 켜줘", "나비"
     "조명 켜줘" -> False, "", ""
     """
 
@@ -375,8 +375,8 @@ def transcribe_whisper(model, audio_float32: np.ndarray) -> str:
             fp16=False,
             condition_on_previous_text=False,
             temperature=0.0,
-            no_speech_threshold=0.3,
-            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            logprob_threshold=-0.5,
             compression_ratio_threshold=2.4,
         )
 
@@ -420,7 +420,7 @@ def print_startup_info(runtime: EdgeRuntime):
     print(f" TTS 후 마이크 무시: {config.IGNORE_AFTER_TTS_SEC}초")
     print(" 예약어 기능: ON")
     print(f" 예약어 후보: {', '.join(config.WAKE_WORDS)}")
-    print(" 사용 예: 개구리 조명 켜줘")
+    print(" 사용 예: 나비 조명 켜줘")
     print(" 백엔드 연동: ON")
     print(f" Backend URL: {config.BACKEND_URL}")
     print(f" Client ID: {config.CLIENT_ID}")
