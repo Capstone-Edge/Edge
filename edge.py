@@ -1,26 +1,6 @@
 #!/usr/bin/env python3
 """
-Jetson Orin Nano - 음성비서 + 예약어 + Backend process API 연동
-
-기능:
-- 예약어: "나비"
-- 일반 상태에서는 "나비 + 명령" 형식일 때만 백엔드로 전송
-- 재질문 대기 상태에서는 예약어 없이도 사용자 답변을 백엔드로 전송
-- 말하면 자동 녹음
-- Whisper로 STT
-- Backend FastAPI /api/v1/commands/process 로 명령 전송
-- Backend 응답을 gTTS로 블루투스 스피커 출력
-- TTS 출력 중/직후에는 마이크 입력 무시
-- VAD 녹음 파일을 last_vad_record.wav로 저장해서 디버깅 가능
-
-실행 예:
-BACKEND_URL=http://100.104.72.38:8000 INPUT_DEVICE=24 WHISPER_MODEL=small python3 edge.py
-
-빠른 테스트:
-BACKEND_URL=http://100.104.72.38:8000 INPUT_DEVICE=24 WHISPER_MODEL=base python3 edge.py
-
-종료:
-Ctrl + C
+Jetson Orin Nano 음성비서: VAD, Whisper STT, 예약어, Backend API, TTS 연동.
 """
 
 import os
@@ -42,10 +22,6 @@ import config
 from backend_client import BackendClient
 
 
-# ============================================================
-# 전역 상태
-# ============================================================
-
 audio_q = queue.Queue(maxsize=100)
 
 is_tts_playing = False
@@ -53,16 +29,7 @@ ignore_audio_until = 0.0
 
 
 class EdgeRuntime:
-    """
-    Edge 실행 상태 관리.
-
-    여기서 관리하는 상태:
-    - current_session_id
-    - waiting_for_clarification
-
-    즉, 백엔드가 재질문 중이면 session_id를 유지하고,
-    executed / cancelled / expired면 세션을 초기화한다.
-    """
+    """Backend 세션 상태와 응답 처리를 관리한다."""
 
     def __init__(self):
         self.backend_client = BackendClient(
@@ -77,15 +44,6 @@ class EdgeRuntime:
         self.waiting_for_clarification = False
 
     def update_session_state_from_result(self, result: dict | None) -> None:
-        """
-        Backend /api/v1/commands/process 응답 status에 따라
-        Edge의 current_session_id를 저장하거나 비운다.
-
-        요구사항:
-        1. waiting_clarification이면 session_id 저장
-        2. executed / cancelled / expired이면 session_id 초기화
-        """
-
         if result is None:
             print("[SESSION WARN] 백엔드 result 없음 → 기존 세션 상태 유지")
             return
@@ -115,17 +73,11 @@ class EdgeRuntime:
             self.waiting_for_clarification = False
             return
 
-        # 백엔드가 다른 status를 주는 경우 안전하게 세션을 비운다.
         print(f"[SESSION WARN] 알 수 없는 status={status} → session_id 초기화")
         self.current_session_id = None
         self.waiting_for_clarification = False
 
     def backend_ai_reply(self, user_text: str) -> str:
-        """
-        엣지 STT 결과를 백엔드 /api/v1/commands/process 로 보내고,
-        TTS로 읽을 response_text를 반환한다.
-        """
-
         reply_text, result = self.backend_client.request_ai_reply(
             user_text=user_text,
             session_id=self.current_session_id,
@@ -142,12 +94,7 @@ class EdgeRuntime:
         return "[READY] 계속 듣는 중입니다. '나비 + 명령'으로 말하세요."
 
 
-# ============================================================
-# 오디오 큐 / 콜백
-# ============================================================
-
 def clear_audio_queue():
-    """마이크 큐에 쌓인 오래된 오디오 제거"""
     try:
         while True:
             audio_q.get_nowait()
@@ -156,15 +103,6 @@ def clear_audio_queue():
 
 
 def audio_callback(indata, frames, time_info, status):
-    """
-    마이크 콜백.
-
-    핵심:
-    - TTS 출력 중에는 입력을 버림
-    - TTS 직후 잔향 구간도 입력을 버림
-    - 큐가 가득 차면 새 입력을 버려 overflow 누적을 줄임
-    """
-
     global is_tts_playing
     global ignore_audio_until
 
@@ -182,12 +120,7 @@ def audio_callback(indata, frames, time_info, status):
         pass
 
 
-# ============================================================
-# 예약어 처리
-# ============================================================
-
 def normalize_text(text: str) -> str:
-    """예약어 비교용 정규화"""
     return (
         text.lower()
         .replace(" ", "")
@@ -201,11 +134,17 @@ def normalize_text(text: str) -> str:
     )
 
 
+NORMALIZED_WAKE_WORDS = [
+    (normalize_text(wake_word), wake_word)
+    for wake_word in config.WAKE_WORDS
+]
+WAKE_WORDS_BY_LENGTH = sorted(config.WAKE_WORDS, key=len, reverse=True)
+
+
 def remove_wake_words_from_text(text: str) -> str:
-    """원문에서 예약어 후보를 제거"""
     command = text.strip()
 
-    for wake_word in sorted(config.WAKE_WORDS, key=len, reverse=True):
+    for wake_word in WAKE_WORDS_BY_LENGTH:
         command = command.replace(wake_word, "")
         command = command.replace(wake_word.upper(), "")
         command = command.replace(wake_word.capitalize(), "")
@@ -217,21 +156,10 @@ def remove_wake_words_from_text(text: str) -> str:
 
 
 def extract_command_with_wake_word(text: str):
-    """
-    예약어가 있으면 (True, command, wake_word) 반환.
-    예약어가 없으면 (False, "", "") 반환.
-
-    예:
-    "나비 조명 켜줘" -> True, "조명 켜줘", "나비"
-    "조명 켜줘" -> False, "", ""
-    """
-
     original = text.strip()
     normalized = normalize_text(original)
 
-    for wake_word in config.WAKE_WORDS:
-        normalized_wake_word = normalize_text(wake_word)
-
+    for normalized_wake_word, wake_word in NORMALIZED_WAKE_WORDS:
         if normalized_wake_word in normalized:
             command = remove_wake_words_from_text(original)
             return True, command, wake_word
@@ -239,13 +167,8 @@ def extract_command_with_wake_word(text: str):
     return False, "", ""
 
 
-# ============================================================
-# TTS
-# ============================================================
-
 def warmup_speaker():
     """블루투스 스피커가 SUSPENDED 상태에서 깨어나도록 짧은 무음 재생"""
-
     try:
         subprocess.run(
             [
@@ -278,16 +201,6 @@ def warmup_speaker():
 
 
 def speak_tts(text: str):
-    """
-    gTTS로 한국어 음성을 생성하고 PulseAudio sink로 재생.
-
-    중요:
-    - TTS 시작 전 큐 비움
-    - TTS 중 마이크 입력 무시
-    - TTS 종료 후 일정 시간 마이크 입력 무시
-    - TTS 중 쌓인 오디오 큐 제거
-    """
-
     global is_tts_playing
     global ignore_audio_until
 
@@ -333,16 +246,7 @@ def speak_tts(text: str):
             os.remove(mp3_path)
 
 
-# ============================================================
-# Whisper STT
-# ============================================================
-
 def transcribe_whisper(model, audio_float32: np.ndarray) -> str:
-    """
-    float32 오디오를 wav로 저장한 뒤 Whisper STT 수행.
-    SAVE_LAST_VAD_RECORD=True면 last_vad_record.wav를 남김.
-    """
-
     tmp_path = None
     should_delete = True
 
@@ -396,9 +300,10 @@ def bytes_to_float32_audio(audio_bytes: bytes) -> np.ndarray:
     return audio_int16.astype(np.float32) / 32768.0
 
 
-# ============================================================
-# 디버그 출력
-# ============================================================
+def reset_recording_state(pre_roll):
+    pre_roll.clear()
+    return False, [], 0, 0, None
+
 
 def print_audio_devices():
     print("\n[DEVICE] sounddevice 장치 목록")
@@ -429,10 +334,6 @@ def print_startup_info(runtime: EdgeRuntime):
     print(" 종료: Ctrl + C")
     print("=" * 60)
 
-
-# ============================================================
-# 메인 루프
-# ============================================================
 
 def main():
     global ignore_audio_until
@@ -479,12 +380,9 @@ def main():
             # TTS 직후 잔향 구간이면 큐 비우고 무시
             if time.time() < ignore_audio_until:
                 clear_audio_queue()
-                triggered = False
-                speech_frames = []
-                pre_roll.clear()
-                silence_count = 0
-                voiced_count = 0
-                record_start_time = None
+                triggered, speech_frames, silence_count, voiced_count, record_start_time = (
+                    reset_recording_state(pre_roll)
+                )
                 continue
 
             expected_bytes = config.FRAME_SAMPLES * 2
@@ -532,13 +430,9 @@ def main():
                     audio_float32 = bytes_to_float32_audio(audio_bytes)
                     duration = len(audio_float32) / config.SAMPLE_RATE
 
-                    # 녹음 상태 초기화
-                    triggered = False
-                    speech_frames = []
-                    pre_roll.clear()
-                    silence_count = 0
-                    voiced_count = 0
-                    record_start_time = None
+                    triggered, speech_frames, silence_count, voiced_count, record_start_time = (
+                        reset_recording_state(pre_roll)
+                    )
 
                     if duration < config.MIN_RECORD_SEC:
                         print(f"[SKIP] 녹음이 너무 짧음: {duration:.2f}초")
@@ -557,11 +451,6 @@ def main():
 
                     print(f'[USER] "{user_text}"')
 
-                    # ----------------------------------------------------
-                    # 핵심 분기:
-                    # 1. 재질문 대기 중이면 예약어 없이도 백엔드로 전송
-                    # 2. 일반 상태면 예약어가 있어야 백엔드로 전송
-                    # ----------------------------------------------------
                     if runtime.waiting_for_clarification:
                         command = user_text.strip()
 
@@ -592,13 +481,9 @@ def main():
 
                     speak_tts(reply)
 
-                    # TTS 후 VAD 상태 재초기화
-                    triggered = False
-                    speech_frames = []
-                    pre_roll.clear()
-                    silence_count = 0
-                    voiced_count = 0
-                    record_start_time = None
+                    triggered, speech_frames, silence_count, voiced_count, record_start_time = (
+                        reset_recording_state(pre_roll)
+                    )
                     clear_audio_queue()
 
                     print(runtime.ready_message())
